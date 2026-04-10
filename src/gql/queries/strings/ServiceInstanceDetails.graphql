@@ -1,0 +1,51 @@
+query ServiceInstanceDetails(
+  $serviceId: String!
+  $environmentId: String!
+) {
+  serviceInstance(
+    serviceId: $serviceId
+    environmentId: $environmentId
+  ) {
+    id
+    serviceId
+    serviceName
+    environmentId
+    startCommand
+    buildCommand
+    preDeployCommand
+    healthcheckPath
+    healthcheckTimeout
+    restartPolicyType
+    restartPolicyMaxRetries
+    cronSchedule
+    numReplicas
+    sleepApplication
+    regions
+    multiRegionConfig
+    builder
+    dockerfilePath
+    railpackVersion
+    watchPatterns
+    source {
+      repo
+      image
+    }
+    latestDeployment {
+      id
+      meta
+      status
+    }
+    domains {
+      serviceDomains {
+        id
+        domain
+        targetPort
+      }
+      customDomains {
+        id
+        domain
+        targetPort
+      }
+    }
+  }
+}

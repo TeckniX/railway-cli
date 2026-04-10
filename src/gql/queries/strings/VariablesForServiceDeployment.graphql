@@ -9,3 +9,25 @@ query VariablesForServiceDeployment(
 		serviceId: $serviceId
 	)
 }
+
+query VariablesForServiceDeployment(
+  $serviceId: String!
+  $environmentId: String!
+) {
+  variables(
+    serviceId: $serviceId
+    environmentId: $environmentId
+  ) {
+    edges {
+      node {
+        name
+        value
+        isSealed
+        references {
+          name
+          value
+        }
+      }
+    }
+  }
+}

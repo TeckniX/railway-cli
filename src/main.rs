@@ -41,6 +41,7 @@ commands!(
     docs,
     down,
     environment(env),
+    export(env),
     init,
     link,
     list,
