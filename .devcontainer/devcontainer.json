@@ -1,0 +1,40 @@
+{
+    "name": "Rust",
+    "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+    "features": {
+        // Official Rust feature (installs latest stable + common tools)
+        "ghcr.io/devcontainers/features/rust:1": {
+            "version": "stable",
+            "profile": "minimal" // or "default" if you want more components
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml"
+            ]
+        },
+        "settings": {
+            "rust-analyzer.check.command": "clippy",
+            "rust-analyzer.checkOnSave": true,
+            "editor.formatOnSave": true,
+            "files.insertFinalNewline": true,
+            "terminal.integrated.defaultProfile.linux": "bash"
+        }
+    },
+    // Optional: Speed up subsequent builds by persisting cargo registry and git dependencies
+    "mounts": [
+        {
+            "source": "cargo-registry",
+            "target": "/usr/local/cargo/registry",
+            "type": "volume"
+        },
+        {
+            "source": "cargo-git",
+            "target": "/usr/local/cargo/git",
+            "type": "volume"
+        }
+    ],
+    "postCreateCommand": "cargo --version"
+}
