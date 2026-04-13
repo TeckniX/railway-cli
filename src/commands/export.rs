@@ -289,8 +289,17 @@ fn extract_service_config(
     };
 
     let source = &si.source;
-    let img = source.as_ref().and_then(|s| s.image.as_ref()).cloned();
-    let repo = source.as_ref().and_then(|s| s.repo.as_ref()).cloned();
+    let source_image = source.as_ref().and_then(|s| s.image.as_ref()).cloned();
+    let source_repo = source.as_ref().and_then(|s| s.repo.as_ref()).cloned();
+
+    let deployment_image = deployment
+        .and_then(|d| d.meta.as_ref())
+        .and_then(|m| m.get("image"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let image = source_image.or(deployment_image);
+    let repo = source_repo;
 
     let build = BuildConfig {
         builder: get_obj_string(build_config, "builder"),
@@ -298,7 +307,7 @@ fn extract_service_config(
         nixpacks_version: get_obj_string(build_config, "nixpacksVersion"),
         dockerfile_path: get_obj_string(build_config, "dockerfilePath"),
         nixpacks_config_path: get_obj_string(build_config, "nixpacksConfigPath"),
-        image: img,
+        image: image,
         repo: repo,
     };
 
