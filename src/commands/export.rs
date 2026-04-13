@@ -51,6 +51,8 @@ struct RailwayToml {
     deploy: Option<DeployConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     environments: Option<std::collections::BTreeMap<String, EnvironmentConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volumes: Option<Vec<VolumeConfig>>,
 }
 
 #[derive(Serialize, Default)]
@@ -61,13 +63,15 @@ struct BuildConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     build_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    nixpacks_plan: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     nixpacks_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dockerfile_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nixpacks_config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
 }
 
 #[derive(Serialize, Default)]
@@ -104,6 +108,19 @@ struct EnvironmentConfig {
     build: Option<BuildConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deploy: Option<DeployConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volumes: Option<Vec<VolumeConfig>>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct VolumeConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_mb: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mount_path: Option<String>,
 }
 
 pub async fn command(args: Args) -> Result<()> {
@@ -130,9 +147,10 @@ pub async fn command(args: Args) -> Result<()> {
     let service = select_service_with_linked(&project, &environment, args.service.clone(), linked_project.as_ref())?;
 
     let project_details = fetch_project_details(project.id()).await?;
+    let deployments = fetch_deployment_details(project.id(), &environment.id, 5i64).await?;
 
     let service_config =
-        extract_service_config(&project_details, &environment.id, service.as_ref());
+        extract_service_config(&project_details, &environment.id, service.as_ref(), &deployments);
 
     let toml = build_railway_toml(service_config?, &environment.name);
 
@@ -173,10 +191,38 @@ async fn fetch_project_details(project_id: &str) -> Result<queries::project::Res
     Ok(response)
 }
 
+async fn fetch_deployment_details(
+    project_id: &str,
+    environment_id: &str,
+    first: i64,
+) -> Result<Vec<queries::deployments::DeploymentsDeploymentsEdgesNode>> {
+    let configs = Configs::new()?;
+    let vars = queries::deployments::Variables {
+        input: queries::deployments::DeploymentListInput {
+            project_id: Some(project_id.to_string()),
+            environment_id: Some(environment_id.to_string()),
+            service_id: None,
+            include_deleted: None,
+            status: None,
+        },
+        first: Some(first),
+    };
+    let client = GQLClient::new_authorized(&configs)?;
+    let response: queries::deployments::ResponseData =
+        post_graphql::<queries::Deployments, _>(&client, configs.get_backboard(), vars).await?;
+    Ok(response
+        .deployments
+        .edges
+        .into_iter()
+        .map(|e| e.node)
+        .collect())
+}
+
 fn extract_service_config(
     project: &queries::project::ResponseData,
     environment_id: &str,
     service: Option<&NormalisedService>,
+    deployments: &[queries::deployments::DeploymentsDeploymentsEdgesNode],
 ) -> ServiceConfigResult {
     let project = &project.project;
 
@@ -213,55 +259,93 @@ fn extract_service_config(
         None => return Err(RailwayError::ServiceNotFound(service_id.to_string()).into()),
     };
 
-    let latest_deployment = si.latest_deployment.as_ref();
+    let deployment = deployments.first();
+    let meta = deployment.and_then(|d| d.meta.as_ref());
+    let service_manifest = meta.and_then(|m| m.get("serviceManifest"));
 
-    let meta = latest_deployment.and_then(|d| d.meta.as_ref());
+    let build_config = service_manifest
+        .and_then(|sm| sm.get("build"))
+        .and_then(|b| b.as_object());
 
-    let get_meta_string = |key: &str| -> Option<String> {
-        meta.and_then(|m| m.get(key).and_then(|v| v.as_str().map(String::from)))
+    let deploy_config = service_manifest
+        .and_then(|sm| sm.get("deploy"))
+        .and_then(|d| d.as_object());
+
+    let get_obj_string = |obj: Option<&serde_json::Map<String, Value>>, key: &str| -> Option<String> {
+        obj.and_then(|o| o.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
     };
 
-    let get_meta_value = |key: &str| -> Option<Value> { meta.and_then(|m| m.get(key).cloned()) };
-
-    let get_meta_i64 = |key: &str| -> Option<i32> {
-        meta.and_then(|m| m.get(key).and_then(|v| v.as_i64()))
+    let get_obj_i64 = |obj: Option<&serde_json::Map<String, Value>>, key: &str| -> Option<i32> {
+        obj.and_then(|o| o.get(key))
+            .and_then(|v| v.as_i64())
             .map(|v| v as i32)
     };
 
-    let get_meta_bool =
-        |key: &str| -> Option<bool> { meta.and_then(|m| m.get(key).and_then(|v| v.as_bool())) };
+    let get_obj_bool = |obj: Option<&serde_json::Map<String, Value>>, key: &str| -> Option<bool> {
+        obj.and_then(|o| o.get(key))
+            .and_then(|v| v.as_bool())
+    };
+
+    let source = &si.source;
+    let img = source.as_ref().and_then(|s| s.image.as_ref()).cloned();
+    let repo = source.as_ref().and_then(|s| s.repo.as_ref()).cloned();
 
     let build = BuildConfig {
-        builder: None,
-        build_command: None,
-        nixpacks_plan: get_meta_value("buildCommand"),
-        nixpacks_version: get_meta_string("nixpacksVersion"),
-        dockerfile_path: get_meta_string("dockerfilePath"),
-        nixpacks_config_path: get_meta_string("nixpacksConfigPath"),
+        builder: get_obj_string(build_config, "builder"),
+        build_command: get_obj_string(build_config, "buildCommand"),
+        nixpacks_version: get_obj_string(build_config, "nixpacksVersion"),
+        dockerfile_path: get_obj_string(build_config, "dockerfilePath"),
+        nixpacks_config_path: get_obj_string(build_config, "nixpacksConfigPath"),
+        image: img,
+        repo: repo,
     };
+
+    let volume_instances = &env.volume_instances.edges;
+    let volumes: Vec<VolumeConfig> = volume_instances
+        .iter()
+        .filter(|vi| vi.node.service_id.as_deref() == Some(service_id))
+        .filter_map(|vi| {
+            let vol_name = vi.node.volume.name.clone();
+            if vol_name.is_empty() {
+                return None;
+            }
+            Some(VolumeConfig {
+                name: Some(vol_name),
+                size_mb: Some(vi.node.size_mb as i32),
+                mount_path: Some(vi.node.mount_path.clone()),
+            })
+        })
+        .collect();
 
     let deploy = DeployConfig {
-        start_command: si.start_command.clone(),
-        pre_deploy_command: get_meta_string("preDeployCommand"),
-        num_replicas: get_meta_i64("numReplicas"),
-        healthcheck_path: get_meta_string("healthcheckPath"),
-        healthcheck_timeout: get_meta_i64("healthcheckTimeout"),
-        restart_policy_type: get_meta_string("restartPolicyType"),
-        restart_policy_max_retries: get_meta_i64("restartPolicyMaxRetries"),
-        cron_schedule: si.cron_schedule.clone(),
-        region: get_meta_string("region"),
-        runtime: get_meta_string("runtime"),
-        sleep_application: get_meta_bool("sleepApplication"),
+        start_command: si.start_command.clone().or_else(|| get_obj_string(deploy_config, "startCommand")),
+        pre_deploy_command: get_obj_string(deploy_config, "preDeployCommand"),
+        num_replicas: get_obj_i64(deploy_config, "numReplicas"),
+        healthcheck_path: get_obj_string(deploy_config, "healthcheckPath"),
+        healthcheck_timeout: get_obj_i64(deploy_config, "healthcheckTimeout"),
+        restart_policy_type: get_obj_string(deploy_config, "restartPolicyType"),
+        restart_policy_max_retries: get_obj_i64(deploy_config, "restartPolicyMaxRetries"),
+        cron_schedule: si.cron_schedule.clone().or_else(|| get_obj_string(deploy_config, "cronSchedule")),
+        region: get_obj_string(deploy_config, "region"),
+        runtime: get_obj_string(deploy_config, "runtime"),
+        sleep_application: get_obj_bool(deploy_config, "sleepApplication"),
     };
 
-    Ok((build, deploy))
+    Ok((build, deploy, volumes))
 }
 
-type ServiceConfigResult = Result<(BuildConfig, DeployConfig)>;
+type ServiceConfigResult = Result<(BuildConfig, DeployConfig, Vec<VolumeConfig>)>;
 
-fn build_railway_toml((build, deploy): (BuildConfig, DeployConfig), _env_name: &str) -> RailwayToml {
-    let has_build =
-        build.builder.is_some() || build.build_command.is_some() || build.nixpacks_plan.is_some();
+fn build_railway_toml(
+    (build, deploy, volumes): (BuildConfig, DeployConfig, Vec<VolumeConfig>),
+    _env_name: &str,
+) -> RailwayToml {
+    let has_build = build.builder.is_some()
+        || build.build_command.is_some()
+        || build.image.is_some()
+        || build.repo.is_some();
     let has_deploy = deploy.start_command.is_some()
         || deploy.num_replicas.is_some()
         || deploy.healthcheck_path.is_some();
@@ -270,10 +354,18 @@ fn build_railway_toml((build, deploy): (BuildConfig, DeployConfig), _env_name: &
 
     let default_deploy = if has_deploy { Some(deploy) } else { None };
 
+    let has_volumes = !volumes.is_empty();
+    let root_volumes = if has_volumes {
+        Some(volumes)
+    } else {
+        None
+    };
+
     RailwayToml {
         build: default_build,
         deploy: default_deploy,
         environments: None,
+        volumes: root_volumes,
     }
 }
 
