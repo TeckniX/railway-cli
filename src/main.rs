@@ -40,6 +40,7 @@ commands!(
     domain,
     docs,
     down,
+    export,
     environment(env),
     init,
     link,

@@ -7,6 +7,7 @@ use std::fmt::Display;
 use std::fs;
 
 use crate::{
+    config::Configs,
     errors::RailwayError,
     util::prompt::{fake_select, prompt_options, prompt_options_skippable},
     workspace::{Project, Workspace, workspaces},
@@ -106,14 +107,27 @@ struct EnvironmentConfig {
 }
 
 pub async fn command(args: Args) -> Result<()> {
+    let configs = Configs::new()?;
+
+    let linked_project = configs.get_linked_project().await.ok();
+
     let workspaces = workspaces().await?;
-    let workspace = select_workspace(args.project.clone(), args.workspace.clone(), workspaces)?;
+    let workspace = select_workspace_with_linked(
+        args.workspace.clone(),
+        args.project.clone(),
+        linked_project.as_ref(),
+        workspaces,
+    )?;
 
-    let project = select_project(workspace, args.project.clone())?;
+    let project = select_project_with_linked(workspace, args.project.clone(), linked_project.as_ref())?;
 
-    let environment = select_environment(args.environment, &project)?;
+    let environment = select_environment_with_linked(
+        args.environment.clone(),
+        &project,
+        linked_project.as_ref(),
+    )?;
 
-    let service = select_service(&project, &environment, args.service)?;
+    let service = select_service_with_linked(&project, &environment, args.service.clone(), linked_project.as_ref())?;
 
     let project_details = fetch_project_details(project.id()).await?;
 
@@ -263,10 +277,11 @@ fn build_railway_toml((build, deploy): (BuildConfig, DeployConfig), _env_name: &
     }
 }
 
-fn select_service(
+fn select_service_with_linked(
     project: &NormalisedProject,
     environment: &NormalisedEnvironment,
     service: Option<String>,
+    linked_project: Option<&crate::config::LinkedProject>,
 ) -> Result<Option<NormalisedService>, anyhow::Error> {
     let useful_services = project
         .services
@@ -279,32 +294,46 @@ fn select_service(
         .cloned()
         .collect::<Vec<NormalisedService>>();
 
-    let service = if !useful_services.is_empty() {
-        if let Some(service) = service {
-            let service_norm = useful_services.iter().find(|s| {
-                (s.name.to_lowercase() == service.to_lowercase())
-                    || (s.id.to_lowercase() == service.to_lowercase())
-            });
-            if let Some(service) = service_norm {
-                fake_select("Select a service", &service.name);
-                Some(service.clone())
-            } else {
-                return Err(RailwayError::ServiceNotFound(service).into());
-            }
-        } else if std::io::stdout().is_terminal() {
-            prompt_options_skippable("Select a service <esc to skip>", useful_services)?
+    if useful_services.is_empty() {
+        return Ok(None);
+    }
+
+    let linked_service_id = linked_project
+        .as_ref()
+        .and_then(|lp| lp.service.as_deref());
+
+    let linked_service = linked_service_id.and_then(|ls| {
+            useful_services.iter().find(|s| {
+                s.id.to_lowercase() == ls.to_lowercase()
+                    || s.name.to_lowercase() == ls.to_lowercase()
+            })
+        });
+
+    let service = if let Some(service) = service {
+        let service_norm = useful_services.iter().find(|s| {
+            (s.name.to_lowercase() == service.to_lowercase())
+                || (s.id.to_lowercase() == service.to_lowercase())
+        });
+        if let Some(service) = service_norm {
+            fake_select("Select a service", &service.name);
+            Some(service.clone())
         } else {
-            None
+            return Err(RailwayError::ServiceNotFound(service).into());
         }
+    } else if let Some(ls) = linked_service {
+        Some(ls.clone())
+    } else if std::io::stdout().is_terminal() {
+        prompt_options_skippable("Select a service <esc to skip>", useful_services)?
     } else {
         None
     };
     Ok(service)
 }
 
-fn select_environment(
+fn select_environment_with_linked(
     environment: Option<String>,
     project: &NormalisedProject,
+    linked_project: Option<&crate::config::LinkedProject>,
 ) -> Result<NormalisedEnvironment, anyhow::Error> {
     if project.environments.is_empty() {
         if project.has_restricted_environments {
@@ -313,6 +342,18 @@ fn select_environment(
             bail!("Project has no environments");
         }
     }
+
+    let linked_env_id = linked_project
+        .as_ref()
+        .and_then(|lp| lp.environment.as_deref());
+
+    let linked_env = linked_env_id.and_then(|le| {
+        project.environments.iter().find(|e| {
+            e.id.to_lowercase() == le.to_lowercase()
+                || e.name.to_lowercase() == le.to_lowercase()
+        })
+        .cloned()
+    });
 
     let environment = if let Some(environment) = environment {
         let env = project.environments.iter().find(|e| {
@@ -325,6 +366,8 @@ fn select_environment(
         } else {
             return Err(RailwayError::EnvironmentNotFound(environment).into());
         }
+    } else if let Some(le) = linked_env {
+        le.clone()
     } else if project.environments.len() == 1 {
         let env = project.environments[0].clone();
         fake_select("Select an environment", &env.name);
@@ -340,15 +383,28 @@ fn select_environment(
     Ok(environment)
 }
 
-fn select_project(
+fn select_project_with_linked(
     workspace: Workspace,
     project: Option<String>,
+    linked_project: Option<&crate::config::LinkedProject>,
 ) -> Result<NormalisedProject, anyhow::Error> {
     let projects = workspace
         .projects()
         .into_iter()
         .filter(|p| p.deleted_at().is_none())
         .collect::<Vec<_>>();
+
+    let linked_proj_id = linked_project
+        .as_ref()
+        .map(|lp| lp.project.as_str());
+
+    let linked_proj = linked_proj_id.and_then(|lpproj| {
+        projects.iter().find(|p| {
+            p.id().to_lowercase() == lpproj.to_lowercase()
+                || p.name().to_lowercase() == lpproj.to_lowercase()
+        })
+    })
+    .cloned();
 
     let project = NormalisedProject::from({
         if let Some(project) = project {
@@ -366,6 +422,9 @@ fn select_project(
                 )
                 .into());
             }
+        } else if let Some(lp) = linked_proj {
+            fake_select("Select a project", &lp.to_string());
+            lp
         } else {
             prompt_workspace_projects(projects)?
         }
@@ -373,9 +432,10 @@ fn select_project(
     Ok(project)
 }
 
-fn select_workspace(
-    project: Option<String>,
+fn select_workspace_with_linked(
     workspace_name: Option<String>,
+    project: Option<String>,
+    linked_project: Option<&crate::config::LinkedProject>,
     workspaces: Vec<Workspace>,
 ) -> Result<Workspace, anyhow::Error> {
     let workspace = match (project, workspace_name) {
@@ -406,7 +466,20 @@ fn select_workspace(
                 return Err(RailwayError::WorkspaceNotFound(workspace_arg.clone()).into());
             }
         }
-        (None, None) => prompt_workspaces(workspaces)?,
+        (None, None) => {
+            if let Some(lp) = linked_project {
+                if let Some(workspace) = workspaces.iter().find(|w| {
+                    w.projects().iter().any(|pro| {
+                        pro.id().to_lowercase() == lp.project.to_lowercase()
+                            || pro.name().to_lowercase() == lp.name.as_ref().map(|n| n.to_lowercase()).unwrap_or_default()
+                    })
+                }) {
+                    fake_select("Select a workspace", workspace.name());
+                    return Ok(workspace.clone());
+                }
+            }
+            prompt_workspaces(workspaces)?
+        }
     };
     Ok(workspace)
 }
